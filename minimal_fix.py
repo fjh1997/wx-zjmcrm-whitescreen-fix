@@ -5,14 +5,16 @@
 根因：前端 aesEncrypt 后提交 32 位 Hex 订单号，网关按原始字符串 length≤14 校验。
 修复：详情请求改为 ≤14 位数字明文；热补 oneStationUser.js 同步去掉 aesEncrypt 组参。
 
-用法:
+用法（Windows 推荐用 start_minimal.ps1，保证环境变量传入）:
   mitmdump -p 8888 -s minimal_fix.py --ssl-insecure --set block_global=false
-  ProxyBridge: Weixin.exe;WeChatAppEx.exe → 127.0.0.1:8888
+  ProxyBridge（管理员）: Weixin.exe;WeChatAppEx.exe → 127.0.0.1:8888
 
 可选环境变量:
-  ZJ_ORDER_ID  14 位订单号（解密失败时的兜底，必填或写默认）
-  ZJ_AES_KEY   URL 密文解密密钥（来自 GET_STATIC_DATA）
+  ZJ_ORDER_ID  14 位订单号（解密失败时的兜底；强烈建议设置）
+  ZJ_AES_KEY   URL/字段密文解密密钥（来自 GET_STATIC_DATA）
   ZJ_REGION    地市编码，默认 579
+
+验收: minimal_fix.log 出现 "DETAIL body -> plain ..." 才算改写生效。
 """
 from mitmproxy import http
 import json, re, time, os
@@ -21,9 +23,9 @@ DIR = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(DIR, "minimal_fix.log")
 BEST = os.path.join(DIR, "live_best.json")
 
-ORDER_PLAIN = os.environ.get("ZJ_ORDER_ID", "")  # 设为你的 14 位订单号
-REGION = os.environ.get("ZJ_REGION", "579")
-AES_KEY = os.environ.get("ZJ_AES_KEY", "")  # 可选，用于解 URL 密文
+ORDER_PLAIN = os.environ.get("ZJ_ORDER_ID", "").strip()
+REGION = os.environ.get("ZJ_REGION", "579").strip() or "579"
+AES_KEY = os.environ.get("ZJ_AES_KEY", "").strip()
 
 
 def _log(msg: str):
@@ -63,19 +65,26 @@ def _to_plain_order(v: str) -> str:
     return (ORDER_PLAIN or "")[:14]
 
 
-def _is_detail(url: str) -> bool:
-    return "QRY_RBOSS_MOBILE_DETAIL" in (url or "").upper()
+def _is_detail(url: str, raw_body: str = "") -> bool:
+    u = (url or "").upper()
+    if "QRY_RBOSS_MOBILE_DETAIL" in u:
+        return True
+    # 少数情况 action 只在 body / 查询串变体里
+    return "QRY_RBOSS_MOBILE_DETAIL" in (raw_body or "").upper()
 
 
 def request(flow: http.HTTPFlow):
     url = flow.request.pretty_url or ""
-    host = flow.request.pretty_host or ""
-    if "chinamobile" not in host and "10086" not in host:
-        return
-    if not _is_detail(url):
-        return
     try:
         raw = flow.request.get_text(strict=False) or ""
+    except Exception:
+        raw = ""
+
+    # 按 action 命中，不依赖 host 域名（微信侧有时显示为纯 IP）
+    if not _is_detail(url, raw):
+        return
+
+    try:
         body = json.loads(raw) if raw.strip().startswith("{") else {}
     except Exception:
         body = {}
@@ -91,7 +100,7 @@ def request(flow: http.HTTPFlow):
 
     cust = _to_plain_order(str(body.get("customerOrderId") or body.get("orderId") or ""))
     if not cust:
-        _log("WARN: no plain order id; set env ZJ_ORDER_ID")
+        _log("WARN: no plain order id; set env ZJ_ORDER_ID=你的14位订单号")
         return
 
     new = {
@@ -109,9 +118,7 @@ def response(flow: http.HTTPFlow):
     if not flow.response:
         return
     url = flow.request.pretty_url or ""
-    host = flow.request.pretty_host or ""
-    if "chinamobile" not in host and "10086" not in host:
-        return
+    path = flow.request.path or ""
 
     try:
         rb = flow.response.get_text(strict=False) or ""
@@ -124,6 +131,10 @@ def response(flow: http.HTTPFlow):
         try:
             j = json.loads(rb)
             good = bool(j.get("order")) and j.get("retCode") in (200, "200")
+            _log(
+                f"DETAIL resp retCode={j.get('retCode')} "
+                f"order_nodes={len(j.get('order') or [])}"
+            )
         except Exception:
             pass
         if (bad or not good) and os.path.exists(BEST):
@@ -140,12 +151,19 @@ def response(flow: http.HTTPFlow):
                 _log(f"inject fail: {e}")
         return
 
-    if "oneStationUser.js" not in url or "oneStationDetail" not in rb:
+    # JS 热补：按路径名命中，不强制 host 含 chinamobile（IP 访问时 pretty_host 是数字）
+    if "oneStationUser.js" not in url and "oneStationUser.js" not in path:
+        return
+    if "oneStationDetail" not in rb and "showOrder" not in rb and "CUST_ORDER_ID" not in rb:
         return
     if "/*MINIMAL_PLAIN_FIX*/" in rb:
         return
 
-    key_line = f"window.AESKey=window.AESKey||'{AES_KEY}';\n" if AES_KEY else "window.AESKey=window.AESKey||'';\n"
+    key_line = (
+        f"window.AESKey=window.AESKey||'{AES_KEY}';\n"
+        if AES_KEY
+        else "window.AESKey=window.AESKey||'';\n"
+    )
     body = "/*MINIMAL_PLAIN_FIX*/\n" + key_line + "try{AESKey=window.AESKey;}catch(e){}\n" + rb
 
     order_js = ORDER_PLAIN or ""
@@ -164,7 +182,7 @@ def response(flow: http.HTTPFlow):
         body2, _ = re.subn(r"aesEncrypt\(\s*PRE_ORDER_ID\s*\)", '""', body, count=1)
         body3, n2 = re.subn(
             r"aesEncrypt\(\s*CUST_ORDER_ID\s*\)",
-            f'"{order_js}"' if order_js else 'CUST_ORDER_ID',
+            f'"{order_js}"' if order_js else "CUST_ORDER_ID",
             body2,
             count=1,
         )
@@ -199,4 +217,10 @@ def response(flow: http.HTTPFlow):
 
 def load(l):
     open(LOG, "w", encoding="utf-8").write(f"start {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-    _log(f"ready: force plain order id ≤14 (ZJ_ORDER_ID={ORDER_PLAIN or '(unset)'})")
+    if not ORDER_PLAIN:
+        _log(
+            "ready: plain order ≤14; WARN ZJ_ORDER_ID unset "
+            "(set before start if AES decrypt unavailable)"
+        )
+    else:
+        _log(f"ready: force plain order id ≤14 (ZJ_ORDER_ID={ORDER_PLAIN})")
