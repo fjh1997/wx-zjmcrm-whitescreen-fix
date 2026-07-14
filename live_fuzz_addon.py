@@ -1,17 +1,37 @@
-from pathlib import Path
 # -*- coding: utf-8 -*-
 """
-浙江移动 一站式订单详情 — mitm 修复 v6
+浙江移动 一站式订单详情白屏 — mitm 修复 v7
 
-Fixes:
-1) DETAIL API: force PLAINTEXT order ids (max 14) — proven retCode 200
-2) showPreTimeAndTimeAreaNew.js "module was broken":
-   - Server often returns empty body without proper cookie/path
-   - Inject cached full module when response empty/short/HTML error
-   - Patch oneStationUser.js to NEVER require New.js (use old module)
-   - Wrap dynamic require in try/catch so init cannot hard-fail
+【主因（实证）】
+  前端 showOrder 固定：
+    customerOrderId = aesEncrypt(明文订单号)  → 32 位 Hex
+  网关 QRY_RBOSS_MOBILE_DETAIL 对字段做「最大长度 14」校验（校验的是
+  请求体里的原始字符串，不会先按业务密钥解密再量长度）。
+  → retCode -9999: strings of this type must have a maximum length of 14
+  → 原前端 if(status) 不检查 retCode，直接 json.order.length → 抛错/空渲染 → 白屏
+
+  对照实验（bootstrap 会话后）：
+    A official_enc (encrypt("")) + encrypt(14位订单号) → -9999
+    B plain 14 位订单号                              → retCode 200 + order[]
+
+  因此：即便 AESKey 完全正确、加解密正常，官方「先加再传」路径仍会白屏。
+  AESKey 作用域问题不是主因；mitm 补丁里 throw 'AESKey is not defined'
+  是注入后的次生噪音。
+
+【次因】
+  showPreTimeAndTimeAreaNew.js 无会话时常 HTTP 200 空 body
+  → SeaJS module was broken → init 中断
+
+【本插件策略】
+  1) DETAIL 请求体强制改为 ≤14 明文订单号
+  2) 热补 oneStationUser.js：param 发明文；跳过 New.js；retCode/order 防护
+  3) 空 JS 模块注入本地缓存
+  4) 仍 -9999 时同步明文重试 / 注入 live_best
 """
+from __future__ import annotations
+
 from mitmproxy import http
+from pathlib import Path
 import json, os, re, time, urllib.request, ssl
 
 DIR = str(Path(__file__).resolve().parent)
@@ -22,11 +42,13 @@ BEST = os.path.join(DIR, "live_best.json")
 FUZZLOG = os.path.join(DIR, "live_fuzz.log")
 JS_DIR = os.path.join(DIR, "js_modules")
 
-AES_KEY = "YOUR_AES_KEY_HEX_FROM_STATIC_DATA"
-ORDER_PLAIN = "YOUR_14_DIGIT_ORDER_ID"
-REGION = "579"
+# 仅用于把 URL 上的 32Hex 解回明文；不是「白屏主因」
+# 可从 GET_STATIC_DATA (BROADBAND_ORDER_QRY_AES_KEY) 抓到后填入
+AES_KEY = os.environ.get("ZJ_AES_KEY", "")  # set env or fill after GET_STATIC_DATA
+# 明文订单号兜底（列表页可见的 14 位）；也可用环境变量覆盖
+ORDER_PLAIN = os.environ.get("ZJ_ORDER_ID", "")  # 14-digit order id fallback
+REGION = os.environ.get("ZJ_REGION", "579")
 
-# local module fallbacks (downloaded with valid session)
 MODULE_FALLBACKS = {
     "showPreTimeAndTimeAreaNew.js": os.path.join(JS_DIR, "showPreTimeAndTimeAreaNew.js"),
     "showPreTimeAndTimeArea.js": os.path.join(JS_DIR, "showPreTimeAndTimeArea.js"),
@@ -58,24 +80,6 @@ def _safe_text(msg):
         return ""
 
 
-def _read_fallback(name: str) -> str | None:
-    path = MODULE_FALLBACKS.get(name)
-    if not path or not os.path.exists(path):
-        # try net_ prefix
-        alt = os.path.join(JS_DIR, "net_" + name)
-        path = alt if os.path.exists(alt) else path
-    if not path or not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            t = f.read()
-        if "define" in t and len(t) > 500:
-            return t
-    except Exception as e:
-        _log(f"fallback read fail {name}: {e}")
-    return None
-
-
 def _aes_dec(hex_ct: str) -> str | None:
     try:
         from Crypto.Cipher import AES
@@ -89,9 +93,29 @@ def _aes_dec(hex_ct: str) -> str | None:
         pad = pt[-1]
         if 1 <= pad <= 16 and pt.endswith(bytes([pad]) * pad):
             pt = pt[:-pad]
-        return pt.decode("utf-8")
+        s = pt.decode("utf-8")
+        return s
     except Exception:
         return None
+
+
+def _to_plain_id(val: str, fallback: str = "") -> str:
+    """把任意形态订单号收敛为 ≤14 明文（网关实际接受的形态）。"""
+    v = (val or "").strip()
+    if not v:
+        return fallback
+    if re.fullmatch(r"\d{10,14}", v):
+        return v[:14]
+    # 32/64 Hex：尝试 AES 解密
+    if re.fullmatch(r"[0-9A-Fa-f]{32,}", v):
+        dec = _aes_dec(v)
+        if dec is not None:
+            if re.fullmatch(r"\d{0,14}", dec):
+                return dec
+            if len(dec) <= 14:
+                return dec
+        return fallback
+    return v[:14] if len(v) > 14 else v
 
 
 def _save_session(flow: http.HTTPFlow):
@@ -127,24 +151,8 @@ def _save_session(flow: http.HTTPFlow):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def _to_plain_id(val: str, fallback: str = "") -> str:
-    v = (val or "").strip()
-    if not v:
-        return fallback
-    if re.fullmatch(r"\d{10,14}", v):
-        return v[:14]
-    dec = _aes_dec(v)
-    if dec is not None:
-        if re.fullmatch(r"\d{0,14}", dec or ""):
-            return dec
-        if len(dec) <= 14:
-            return dec
-    if re.fullmatch(r"[0-9A-Fa-f]{32,}", v):
-        return fallback
-    return v[:14] if len(v) > 14 else v
-
-
 def _rewrite_detail_to_plain(flow: http.HTTPFlow):
+    """主修复：DETAIL body → 明文 ≤14。"""
     url = flow.request.pretty_url or ""
     if "QRY_RBOSS_MOBILE_DETAIL" not in url:
         return
@@ -157,7 +165,10 @@ def _rewrite_detail_to_plain(flow: http.HTTPFlow):
         return
 
     pre = _to_plain_id(str(body.get("preOrderId") or ""), "")
-    cust = _to_plain_id(str(body.get("customerOrderId") or body.get("orderId") or ""), ORDER_PLAIN)
+    cust = _to_plain_id(
+        str(body.get("customerOrderId") or body.get("orderId") or ""),
+        ORDER_PLAIN,
+    )
     if not cust:
         cust = ORDER_PLAIN
     if len(cust) > 14:
@@ -175,7 +186,7 @@ def _rewrite_detail_to_plain(flow: http.HTTPFlow):
     if new_text != raw.strip():
         flow.request.set_text(new_text)
         flow.request.headers["Content-Length"] = str(len(new_text.encode("utf-8")))
-        _log(f"DETAIL -> PLAIN {new_text}")
+        _log(f"DETAIL → PLAIN (len≤14) {new_text}")
         _dump({"type": "rewrite_plain", "from": body, "to": new, "url": url[:300]})
 
 
@@ -190,154 +201,149 @@ def _body_looks_broken(text: str) -> bool:
     return False
 
 
+def _read_fallback(name: str) -> str | None:
+    path = MODULE_FALLBACKS.get(name)
+    if not path or not os.path.exists(path):
+        alt = os.path.join(JS_DIR, "net_" + name)
+        path = alt if os.path.exists(alt) else path
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            t = f.read()
+        if "define" in t and len(t) > 500:
+            return t
+    except Exception as e:
+        _log(f"fallback read fail {name}: {e}")
+    return None
+
+
 def _inject_js_module(flow: http.HTTPFlow) -> bool:
-    """If busi JS module response is empty/broken, inject local good copy."""
     url = flow.request.pretty_url or ""
     if ".js" not in url or "chinamobile.com" not in (flow.request.pretty_host or ""):
         return False
-    # match module filenames
     name = None
     for key in MODULE_FALLBACKS:
         if key in url:
             name = key
             break
+    if not name and ("/rboss/broadband/js/" in url or "/busi/rboss/broadband/js/" in url):
+        base = url.split("?")[0].rstrip("/").split("/")[-1]
+        if base.endswith(".js"):
+            name = base
     if not name:
-        # still catch empty broadband js
-        if "/rboss/broadband/js/" in url or "/busi/rboss/broadband/js/" in url:
-            base = url.split("?")[0].rstrip("/").split("/")[-1]
-            if base.endswith(".js"):
-                name = base
-        else:
-            return False
-
+        return False
     try:
         text = flow.response.get_text(strict=False) or ""
     except Exception:
         text = ""
-
-    # also cache good responses for future
-    if not _body_looks_broken(text) and name:
+    if not _body_looks_broken(text):
         try:
             os.makedirs(JS_DIR, exist_ok=True)
             path = os.path.join(JS_DIR, name)
             if (not os.path.exists(path)) or os.path.getsize(path) < len(text):
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(text)
-                _log(f"cached good module {name} len={len(text)}")
         except Exception:
             pass
         return False
-
-    fb = _read_fallback(name) if name else None
+    fb = _read_fallback(name)
+    if not fb and name == "showPreTimeAndTimeAreaNew.js":
+        fb = _read_fallback("showPreTimeAndTimeArea.js")
+        if fb:
+            _log("New.js empty → inject OLD TimeArea.js content")
     if not fb:
-        # New broken -> use old as stand-in (same exports shape)
-        if name == "showPreTimeAndTimeAreaNew.js":
-            fb = _read_fallback("showPreTimeAndTimeArea.js")
-            if fb:
-                _log("New.js broken -> using OLD showPreTimeAndTimeArea.js as fallback content")
-    if not fb:
-        _log(f"module broken but no fallback: {name or url[:80]} resp_len={len(text)}")
+        _log(f"module broken, no fallback: {name} resp_len={len(text)}")
         return False
-
     flow.response.status_code = 200
     flow.response.set_text(fb)
     flow.response.headers["content-type"] = "application/javascript; charset=utf-8"
     flow.response.headers["cache-control"] = "no-store, no-cache"
     flow.response.headers["content-length"] = str(len(fb.encode("utf-8")))
-    _log(f"INJECT module {name} len={len(fb)} (was broken/empty len={len(text)})")
-    _dump({"type": "inject_js", "name": name, "url": url[:300], "was_len": len(text), "new_len": len(fb)})
+    _log(f"INJECT module {name} len={len(fb)} (was {len(text)})")
     return True
 
 
-# ---- oneStationUser.js patches ----
+# ---- oneStationUser.js：对准主因改 param，不把 AESKey 当主修复 ----
 PATCH_INIT = r"""
 init:function(){
        var self=this;
+       // 密钥只服务 URL 解密 → 得到 ≤14 明文；失败也不要 throw 吓用户
+       window.AESKey = window.AESKey || "";
        var keyParam = {"extParam": "BROADBAND_ORDER_QRY_AES_KEY"};
-       window.AESKey = window.AESKey || "YOUR_AES_KEY_HEX_FROM_STATIC_DATA";
        var afterKey = function() {
            try {
-               window.AESKey = window.AESKey || "YOUR_AES_KEY_HEX_FROM_STATIC_DATA";
-               try { AESKey = window.AESKey; } catch (e0) {}
+               try { AESKey = window.AESKey || AESKey || ""; } catch (e0) {}
                PRE_ORDER_ID = Request("PRE_ORDER_ID") || "";
                CUST_ORDER_ID = Request("CUST_ORDER_ID") || "";
                ORDER_ID = Request("ORDER_ID") || "";
                var skipRegex = /^57[0-9]|^580/;
-               if (PRE_ORDER_ID && !skipRegex.test(PRE_ORDER_ID)) {
-                   try { PRE_ORDER_ID = aesDecrypt(PRE_ORDER_ID); } catch (e1) { PRE_ORDER_ID = ""; }
-               }
-               if (CUST_ORDER_ID && !skipRegex.test(CUST_ORDER_ID)) {
-                   try { CUST_ORDER_ID = aesDecrypt(CUST_ORDER_ID); } catch (e2) {}
-               }
-               if (ORDER_ID && !skipRegex.test(ORDER_ID)) {
-                   try { ORDER_ID = aesDecrypt(ORDER_ID); } catch (e3) {}
-               }
+               var tryDec = function(v){
+                 if(!v) return "";
+                 if(skipRegex.test(v)) return v;
+                 try { return (typeof aesDecrypt==="function") ? aesDecrypt(v) : v; } catch(e){ return v; }
+               };
+               PRE_ORDER_ID = tryDec(PRE_ORDER_ID);
+               CUST_ORDER_ID = tryDec(CUST_ORDER_ID);
+               ORDER_ID = tryDec(ORDER_ID);
+               // 强制收敛到 ≤14（网关真实约束）
                if (PRE_ORDER_ID && PRE_ORDER_ID.length > 14) PRE_ORDER_ID = "";
                if (CUST_ORDER_ID && CUST_ORDER_ID.length > 14) {
                    if (ORDER_ID && ORDER_ID.length <= 14) CUST_ORDER_ID = ORDER_ID;
-                   else CUST_ORDER_ID = CUST_ORDER_ID.slice(0,14);
+                   else if (/^\d{10,14}$/.test(CUST_ORDER_ID)) CUST_ORDER_ID = CUST_ORDER_ID.slice(0,14);
+                   else CUST_ORDER_ID = "";
                }
-               console.log("[FIX v6] PRE", PRE_ORDER_ID, "CUST", CUST_ORDER_ID, "city", Request("city"));
-               // do NOT let time-area module crash detail page
-               try { self.qryTimeAreaConfig(Request("city")); } catch (eT) { console.warn("[FIX] qryTimeAreaConfig", eT); }
+               console.log("[FIX v7] plain PRE=", PRE_ORDER_ID, "CUST=", CUST_ORDER_ID, "city=", Request("city"));
+               try { self.qryTimeAreaConfig(Request("city")); } catch (eT) { console.warn("[FIX v7] timeArea", eT); }
                self.showOrder();
            } catch (e) {
-               console.error("[FIX] init", e);
+               console.error("[FIX v7] init", e);
                try { showInfo("订单初始化失败: " + (e && e.message ? e.message : e)); } catch (e6) {}
            }
        };
-       var applyKeyFromJson = function(json, status) {
-           if (status && json && json.staticDatas && json.staticDatas.length > 0) {
+       var applyKey = function(json, status) {
+           if (status && json && json.staticDatas) {
                for (var k = 0; k < json.staticDatas.length; k++) {
                    if (json.staticDatas[k].codeValue == "01") {
-                       window.AESKey = json.staticDatas[k].codeName;
+                       window.AESKey = json.staticDatas[k].codeName || window.AESKey;
                        try { AESKey = window.AESKey; } catch (e7) {}
                        break;
                    }
                }
            }
-           if (!window.AESKey) window.AESKey = "YOUR_AES_KEY_HEX_FROM_STATIC_DATA";
-           try { AESKey = window.AESKey; } catch (e10) {}
            afterKey();
        };
        try {
            if (Rose && Rose.ajax && Rose.ajax.postJson) {
-               Rose.ajax.postJson(srvMap.get("getStaticData"), keyParam, applyKeyFromJson);
+               Rose.ajax.postJson(srvMap.get("getStaticData"), keyParam, applyKey);
            } else {
-               applyKeyFromJson(null, false);
+               applyKey(null, false);
            }
-       } catch (e) { applyKeyFromJson(null, false); }
+       } catch (e) { applyKey(null, false); }
        },
 """
 
+# 主修复：不要 aesEncrypt，直接发明文（与网关 length≤14 对齐）
 PATCH_PARAM = (
     'var param={\n'
-    '\t\t\t    "preOrderId": (PRE_ORDER_ID && PRE_ORDER_ID.length<=14) ? PRE_ORDER_ID : "",\n'
+    '\t\t\t    "preOrderId": (function(){ var p=PRE_ORDER_ID||""; if(p.length>14) p=""; return p; })(),\n'
     '\t\t\t    "regionId" : REGION_ID,\n'
     '\t\t\t    "customerOrderId" : (function(){ var c=CUST_ORDER_ID||ORDER_ID||""; if(c.length>14) c=c.slice(0,14); return c; })()\n'
     '\t\t\t };'
 )
 
-# Force use old time-area module; never load New.js (broken empty responses)
 PATCH_QRY_TIME = r"""
 	   qryTimeAreaConfig:function(regionId){
 		   cache.isNewPreTimeArea = false;
-		   // FIX v6: skip dynamic require of showPreTimeAndTimeAreaNew.js (often empty -> "module was broken")
-		   // keep preTimeAndTimeAreaJS from top-level require(showPreTimeAndTimeArea.js)
+		   // 主因之外的次因：New.js 空包会 module was broken，直接禁用动态 require
 		   try {
-			   var param = {
-				   paraType: "TIME_AREA_CONFIG",
-				   paraCode: "TIME_AREA_CONFIG",
-				   regionId: regionId
-			   };
+			   var param = { paraType: "TIME_AREA_CONFIG", paraCode: "TIME_AREA_CONFIG", regionId: regionId };
 			   if (Rose && Rose.ajax && Rose.ajax.postJsonSync) {
 				   Rose.ajax.postJsonSync(srvMap.get('getParaDetail'), param, function(json, status) {
-					   // ignore switch to New.js
 					   cache.isNewPreTimeArea = false;
 				   });
 			   }
 		   } catch (e) {
-			   console.warn("[FIX v6] qryTimeAreaConfig soft-fail", e);
 			   cache.isNewPreTimeArea = false;
 		   }
 	   },
@@ -345,9 +351,9 @@ PATCH_QRY_TIME = r"""
 
 
 def patch_js(body: str) -> str:
-    if "/*WX_WHITE_SCREEN_FIX_V6*/" in body:
+    if "/*WX_WHITE_SCREEN_FIX_V7*/" in body:
         return body
-    body = "/*WX_WHITE_SCREEN_FIX_V6*/\nwindow.AESKey = window.AESKey || 'YOUR_AES_KEY_HEX_FROM_STATIC_DATA';\n" + body
+    body = "/*WX_WHITE_SCREEN_FIX_V7*/\nwindow.AESKey = window.AESKey || '';\n" + body
 
     m = re.search(
         r"init\s*:\s*function\s*\(\s*\)\s*\{.*?\},\s*\n\s*qryAESKey\s*:\s*function",
@@ -356,9 +362,8 @@ def patch_js(body: str) -> str:
     )
     if m:
         body = body[: m.start()] + PATCH_INIT + "\n   qryAESKey:function" + body[m.end() :]
-        _log("patched init v6")
+        _log("patched init v7 (plain-first, no AESKey throw)")
 
-    # replace qryTimeAreaConfig block entirely
     m2 = re.search(
         r"qryTimeAreaConfig\s*:\s*function\s*\(\s*regionId\s*\)\s*\{.*?\},\s*\n\s*juage_oper\s*:",
         body,
@@ -366,14 +371,12 @@ def patch_js(body: str) -> str:
     )
     if m2:
         body = body[: m2.start()] + PATCH_QRY_TIME + "\n\t   juage_oper:" + body[m2.end() :]
-        _log("patched qryTimeAreaConfig v6 (no New.js)")
+        _log("patched qryTimeAreaConfig v7 (skip New.js)")
     else:
-        # soft: neuter require of New.js
         body = body.replace(
             "preTimeAndTimeAreaJS = require('rboss/broadband/js/showPreTimeAndTimeAreaNew.js');",
-            "/* FIX skip New.js */ try{ /* keep old */ }catch(e){} // preTimeAndTimeAreaJS = require('...New.js');",
+            "/* v7 skip New.js */",
         )
-        _log("WARN: qryTimeAreaConfig block not found, used string neuter")
 
     body2, n = re.subn(
         r'var\s+param\s*=\s*\{\s*"preOrderId"\s*:\s*aesEncrypt\(\s*PRE_ORDER_ID\s*\)\s*,\s*"regionId"\s*:\s*REGION_ID\s*,\s*"customerOrderId"\s*:\s*aesEncrypt\(\s*CUST_ORDER_ID\s*\)\s*\}\s*;',
@@ -384,20 +387,20 @@ def patch_js(body: str) -> str:
     )
     if n:
         body = body2
-        _log("patched showOrder param -> PLAINTEXT v6")
+        _log("patched showOrder param → PLAIN ≤14 (root fix)")
     else:
-        _log("WARN: showOrder param not found")
+        _log("WARN: showOrder param pattern not found")
 
-    # showOrder calls qryTimeAreaConfig — already safe; also guard inside showOrder duplicate call
     body = body.replace(
         "self.qryTimeAreaConfig(REGION_ID);",
-        "try{ self.qryTimeAreaConfig(REGION_ID); }catch(eQ){ console.warn('[FIX] qryTimeArea',eQ); }",
+        "try{ self.qryTimeAreaConfig(REGION_ID); }catch(eQ){}",
     )
 
+    # 原前端 if(status) 不看 retCode，-9999 仍进 order.length → 白屏
     body = body.replace(
         "Rose.ajax.postJson(srvMap.get(\"oneStationDetail\"), param, function(json, status) {\n     if(status){",
         "Rose.ajax.postJson(srvMap.get(\"oneStationDetail\"), param, function(json, status) {\n"
-        "     if(status && json && (json.retCode==200 || json.retCode==\"200\" || json.order)){",
+        "     if(status && json && (json.retCode==200 || json.retCode==\"200\" || (json.order && json.order.length))){",
     )
     body = body.replace(
         "for(var i=0;i<json.order.length;i++){",
@@ -405,22 +408,29 @@ def patch_js(body: str) -> str:
         "     for(var i=0;i<json.order.length;i++){",
     )
 
+    # 全局 aes：空密钥时返回原文，禁止 throw AESKey is not defined（避免次生报错）
     safe_encrypt = (
         "function aesEncrypt(data) {\n"
-        "  if (!window.AESKey) { window.AESKey='YOUR_AES_KEY_HEX_FROM_STATIC_DATA'; }\n"
-        "  var key = CryptoJS.enc.Hex.parse(window.AESKey);\n"
-        "  var srcs = CryptoJS.enc.Utf8.parse(data || '');\n"
-        "  var encrypted = CryptoJS.AES.encrypt(srcs, key, {iv:'',mode:CryptoJS.mode.ECB,padding:CryptoJS.pad.Pkcs7});\n"
-        "  return encrypted.ciphertext.toString().toUpperCase();\n"
+        "  try {\n"
+        "    var k = window.AESKey || (typeof AESKey!=='undefined'?AESKey:'');\n"
+        "    if (!k) { return data || ''; }\n"
+        "    var key = CryptoJS.enc.Hex.parse(k);\n"
+        "    var srcs = CryptoJS.enc.Utf8.parse(data || '');\n"
+        "    var encrypted = CryptoJS.AES.encrypt(srcs, key, {iv:'',mode:CryptoJS.mode.ECB,padding:CryptoJS.pad.Pkcs7});\n"
+        "    return encrypted.ciphertext.toString().toUpperCase();\n"
+        "  } catch (e) { return data || ''; }\n"
         "}"
     )
     safe_decrypt = (
         "function aesDecrypt(encrypted) {\n"
-        "  if (!window.AESKey) { window.AESKey='YOUR_AES_KEY_HEX_FROM_STATIC_DATA'; }\n"
-        "  var key = CryptoJS.enc.Hex.parse(window.AESKey);\n"
-        "  var srcs = CryptoJS.format.Hex.parse(encrypted);\n"
-        "  var decrypt = CryptoJS.AES.decrypt(srcs, key, {iv:'',mode:CryptoJS.mode.ECB,padding:CryptoJS.pad.Pkcs7});\n"
-        "  return CryptoJS.enc.Utf8.stringify(decrypt);\n"
+        "  try {\n"
+        "    var k = window.AESKey || (typeof AESKey!=='undefined'?AESKey:'');\n"
+        "    if (!k) { return encrypted || ''; }\n"
+        "    var key = CryptoJS.enc.Hex.parse(k);\n"
+        "    var srcs = CryptoJS.format.Hex.parse(encrypted);\n"
+        "    var decrypt = CryptoJS.AES.decrypt(srcs, key, {iv:'',mode:CryptoJS.mode.ECB,padding:CryptoJS.pad.Pkcs7});\n"
+        "    return CryptoJS.enc.Utf8.stringify(decrypt);\n"
+        "  } catch (e) { return encrypted || ''; }\n"
         "}"
     )
     if re.search(r"function\s+aesEncrypt\s*\(", body):
@@ -428,13 +438,11 @@ def patch_js(body: str) -> str:
     if re.search(r"function\s+aesDecrypt\s*\(", body):
         body = re.sub(r"function\s+aesDecrypt\s*\([^)]*\)\s*\{.*?\n\}", safe_decrypt, body, count=2, flags=re.S)
 
-    # Guard top-level require of time area so page can still define module
     body = body.replace(
         "var preTimeAndTimeAreaJS = require('rboss/broadband/js/showPreTimeAndTimeArea.js');",
-        "var preTimeAndTimeAreaJS = (function(){ try { return require('rboss/broadband/js/showPreTimeAndTimeArea.js'); } catch(e){ console.warn('[FIX] old timeArea require',e); return {initParam:function(){},init:function(o){if(o&&o.callback)o.callback([]);},showPreTimeAndTimeArea:function(){}}; } })();",
+        "var preTimeAndTimeAreaJS = (function(){ try { return require('rboss/broadband/js/showPreTimeAndTimeArea.js'); } catch(e){ return {initParam:function(){},init:function(o){if(o&&o.callback)o.callback([]);},showPreTimeAndTimeArea:function(){}}; } })();",
     )
-
-    _log(f"JS patched v6 len={len(body)}")
+    _log(f"JS patched v7 len={len(body)}")
     return body
 
 
@@ -455,8 +463,7 @@ def _post(url: str, body: dict, headers: dict) -> tuple[int, str]:
     for k, v in headers.items():
         if v:
             req.add_header(k, v)
-    if "Content-Type" not in {x.title(): x for x in headers}:
-        req.add_header("Content-Type", "application/json;charset=UTF-8")
+    req.add_header("Content-Type", "application/json;charset=UTF-8")
     try:
         with urllib.request.urlopen(req, timeout=12, context=_ssl()) as resp:
             return resp.status, resp.read().decode("utf-8", errors="replace")
@@ -480,10 +487,9 @@ def _is_good(text: str) -> bool:
         return False
     if "maximum length" in str(j.get("retMessage") or ""):
         return False
-    if j.get("order") or (j.get("addressId") is not None and j.get("clock")):
+    if j.get("order"):
         return True
-    rc = j.get("retCode")
-    return rc in (200, "200", 0, "0")
+    return j.get("retCode") in (200, "200", 0, "0")
 
 
 def request(flow: http.HTTPFlow):
@@ -505,7 +511,6 @@ def response(flow: http.HTTPFlow):
     url = flow.request.pretty_url or ""
     host = flow.request.pretty_host or ""
 
-    # merge Set-Cookie
     if "chinamobile.com" in host or "10086.cn" in host:
         sc = []
         try:
@@ -537,7 +542,6 @@ def response(flow: http.HTTPFlow):
             except Exception:
                 pass
 
-    # Inject broken modules FIRST
     if ".js" in url and ("broadband/js" in url or "showPreTime" in url or "TimeArea" in url or "chooseScheduled" in url or "countdown" in url):
         try:
             _inject_js_module(flow)
@@ -550,7 +554,7 @@ def response(flow: http.HTTPFlow):
             if text and "oneStationDetail" in text:
                 flow.response.set_text(patch_js(text))
                 flow.response.headers["cache-control"] = "no-store, no-cache"
-                _log("rewrote oneStationUser.js v6")
+                _log("rewrote oneStationUser.js v7")
         except Exception as e:
             _log(f"JS rewrite fail: {e}")
 
@@ -582,11 +586,10 @@ def response(flow: http.HTTPFlow):
                 "X-Requested-With": "XMLHttpRequest",
             }
             base = url.split("?")[0]
-            variants = [
+            for b in (
                 {"preOrderId": "", "regionId": REGION, "customerOrderId": ORDER_PLAIN},
                 {"regionId": REGION, "customerOrderId": ORDER_PLAIN},
-            ]
-            for b in variants:
+            ):
                 for q in ("?isconvert=true&action=QRY_RBOSS_MOBILE_DETAIL", "?isconvert=false&action=QRY_RBOSS_MOBILE_DETAIL"):
                     st, text = _post(base + q, b, headers)
                     _log(f"SYNC plain retry st={st} {(text or '')[:100]}")
@@ -626,8 +629,10 @@ def load(l):
     open(FUZZLOG, "w", encoding="utf-8").close()
     with open(LOG, "w", encoding="utf-8") as f:
         f.write(f"start {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-    # verify fallbacks exist
     for k, p in MODULE_FALLBACKS.items():
         exists = os.path.exists(p) or os.path.exists(os.path.join(JS_DIR, "net_" + k))
         _log(f"fallback {k}: {'OK' if exists else 'MISSING'}")
-    _log("FIX v6 ready — inject broken TimeArea JS + skip New.js + PLAIN DETAIL")
+    _log(
+        "FIX v7 ready — ROOT: DETAIL body must be plain ≤14 "
+        "(official aesEncrypt 32hex → -9999); skip empty TimeAreaNew.js"
+    )
